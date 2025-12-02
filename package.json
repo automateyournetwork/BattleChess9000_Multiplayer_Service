@@ -1,0 +1,15 @@
+{
+  "name": "battlechess9000-ws",
+  "version": "1.0.0",
+  "description": "WebSocket backend for BattleChess9000 multiplayer",
+  "main": "server.js",
+  "type": "module",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^4.19.0",
+    "ws": "^8.17.0"
+  }
+}
