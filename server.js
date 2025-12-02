@@ -47,6 +47,7 @@ wss.on("connection", (ws) => {
       return;
     }
 
+    // ---------------- JOIN ----------------
     if (msg.type === "join") {
       const roomId = msg.roomId;
       const name = msg.name || "Player";
@@ -84,7 +85,7 @@ wss.on("connection", (ws) => {
         room.players.forEach((p) => {
           send(p.ws, {
             type: "start",
-            color: p.color
+            color: p.color,
           });
         });
 
@@ -92,6 +93,7 @@ wss.on("connection", (ws) => {
       }
     }
 
+    // ---------------- MOVE ----------------
     if (msg.type === "move") {
       const roomId = msg.roomId;
       const move = msg.move;
@@ -99,6 +101,26 @@ wss.on("connection", (ws) => {
 
       // Relay move to the other player
       broadcastToRoom(roomId, { type: "move", move }, ws);
+    }
+
+    // ---------------- CHAT ----------------
+    if (msg.type === "chat") {
+      const roomId = msg.roomId;
+      const name = msg.name || "Player";
+      const text = msg.text || "";
+
+      if (!roomId || !rooms[roomId] || !text) return;
+
+      // Relay chat to the other player(s), not echoing back to sender
+      broadcastToRoom(
+        roomId,
+        {
+          type: "chat",
+          name,
+          text,
+        },
+        ws
+      );
     }
   });
 
