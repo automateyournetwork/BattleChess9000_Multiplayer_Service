@@ -2,149 +2,165 @@ import express from "express";
 import http from "http";
 import { WebSocketServer } from "ws";
 import cors from "cors";
+import { v4 as uuidv4 } from 'uuid'; // You might need: npm install uuid
 
 const PORT = process.env.PORT || 8080;
-
 const app = express();
 app.use(cors());
 
-// Simple health check for Cloud Run
-app.get("/", (req, res) => {
-  res.send("BattleChess9000 WebSocket server is running.");
-});
+app.get("/", (req, res) => res.send("BattleChess9000 Lobby Server Running"));
 
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server });
 
-// rooms = { ROOM_ID: { players: [ { ws, name, color } ] } }
+// --- STATE MANAGEMENT ---
+// clients = Map<ws, { id, name, avatar, wins, losses, state: 'lobby'|'playing' }>
+const clients = new Map();
+// rooms = { roomId: { players: [ws, ws], gameData... } }
 const rooms = {};
-const clientRoom = new Map(); // ws -> roomId
 
-function send(ws, payload) {
-  if (ws.readyState === ws.OPEN) {
-    ws.send(JSON.stringify(payload));
+// Simple In-Memory Leaderboard (resets on restart)
+const globalStats = {}; // { "Username": { wins: 0, losses: 0 } }
+
+function broadcastLobby() {
+  const lobbyList = [];
+  for (let [ws, data] of clients) {
+    if (data.state === 'lobby') {
+      lobbyList.push({
+        id: data.id,
+        name: data.name,
+        avatar: data.avatar,
+        stats: globalStats[data.name] || { wins: 0, losses: 0 }
+      });
+    }
+  }
+
+  const payload = JSON.stringify({ type: 'lobby_update', players: lobbyList });
+  for (let [ws, data] of clients) {
+    if (data.state === 'lobby' && ws.readyState === ws.OPEN) {
+      ws.send(payload);
+    }
   }
 }
 
-function broadcastToRoom(roomId, payload, exceptWs = null) {
-  const room = rooms[roomId];
-  if (!room) return;
-
-  room.players.forEach((p) => {
-    if (p.ws !== exceptWs && p.ws.readyState === p.ws.OPEN) {
-      p.ws.send(JSON.stringify(payload));
-    }
-  });
+function send(ws, data) {
+  if (ws.readyState === ws.OPEN) ws.send(JSON.stringify(data));
 }
 
 wss.on("connection", (ws) => {
-  ws.on("message", (data) => {
+  const clientId = uuidv4();
+  
+  // Initialize temporary client data
+  clients.set(ws, { 
+    id: clientId, 
+    name: "Guest", 
+    avatar: "w_p", 
+    state: 'connecting' 
+  });
+
+  ws.on("message", (message) => {
     let msg;
-    try {
-      msg = JSON.parse(data.toString());
-    } catch (e) {
-      console.error("Invalid JSON from client:", e);
-      return;
+    try { msg = JSON.parse(message); } catch (e) { return; }
+
+    const clientData = clients.get(ws);
+
+    // --- 1. LOGIN / ENTER LOBBY ---
+    if (msg.type === "login") {
+      const safeName = msg.name.substring(0, 15) || "Player";
+      
+      // Init stats if new user
+      if (!globalStats[safeName]) globalStats[safeName] = { wins: 0, losses: 0 };
+
+      clientData.name = safeName;
+      clientData.avatar = msg.avatar || "w_k";
+      clientData.state = "lobby";
+      
+      clients.set(ws, clientData);
+      
+      send(ws, { type: 'login_success', myId: clientId });
+      broadcastLobby();
     }
 
-    // ---------------- JOIN ----------------
-    if (msg.type === "join") {
-      const roomId = msg.roomId;
-      const name = msg.name || "Player";
-
-      if (!roomId) {
-        send(ws, { type: "error", message: "No roomId provided" });
-        return;
-      }
-
-      if (!rooms[roomId]) {
-        rooms[roomId] = { players: [] };
-      }
-
-      const room = rooms[roomId];
-
-      // Max 2 players per room
-      if (room.players.length >= 2) {
-        send(ws, { type: "error", message: "Room full" });
-        return;
-      }
-
-      room.players.push({ ws, name, color: null });
-      clientRoom.set(ws, roomId);
-
-      console.log(
-        `Client joined room ${roomId}. Now ${room.players.length} player(s).`
-      );
-
-      // When we have 2 players, randomize colors and start
-      if (room.players.length === 2) {
-        const colors = Math.random() < 0.5 ? ["w", "b"] : ["b", "w"];
-        room.players[0].color = colors[0];
-        room.players[1].color = colors[1];
-
-        room.players.forEach((p) => {
-          send(p.ws, {
-            type: "start",
-            color: p.color,
+    // --- 2. SEND CHALLENGE ---
+    if (msg.type === "challenge_request") {
+      const targetId = msg.targetId;
+      
+      // Find target socket
+      for (let [targetWs, targetData] of clients) {
+        if (targetData.id === targetId && targetData.state === 'lobby') {
+          send(targetWs, { 
+            type: 'challenge_received', 
+            fromId: clientData.id, 
+            fromName: clientData.name 
           });
-        });
-
-        console.log(`Room ${roomId} started. Colors:`, colors);
+          return;
+        }
       }
     }
 
-    // ---------------- MOVE ----------------
+    // --- 3. ACCEPT CHALLENGE ---
+    if (msg.type === "challenge_accept") {
+      const opponentId = msg.targetId;
+      let opponentWs = null;
+
+      // Find opponent
+      for (let [oWs, oData] of clients) {
+        if (oData.id === opponentId) { opponentWs = oWs; break; }
+      }
+
+      if (opponentWs) {
+        const roomId = uuidv4();
+        rooms[roomId] = { players: [ws, opponentWs] };
+
+        // Update states
+        clientData.state = 'playing';
+        clients.get(opponentWs).state = 'playing';
+
+        // Assign Colors
+        const p1Color = Math.random() < 0.5 ? 'w' : 'b';
+        const p2Color = p1Color === 'w' ? 'b' : 'w';
+
+        send(ws, { type: 'game_start', roomId, color: p1Color, opponent: clients.get(opponentWs).name });
+        send(opponentWs, { type: 'game_start', roomId, color: p2Color, opponent: clientData.name });
+        
+        broadcastLobby(); // Remove them from the list for others
+      }
+    }
+
+    // --- 4. GAME MOVES ---
     if (msg.type === "move") {
       const roomId = msg.roomId;
-      const move = msg.move;
-      if (!roomId || !rooms[roomId]) return;
-
-      // Relay move to the other player
-      broadcastToRoom(roomId, { type: "move", move }, ws);
+      if (rooms[roomId]) {
+        rooms[roomId].players.forEach(pWs => {
+          if (pWs !== ws) send(pWs, { type: 'move', move: msg.move });
+        });
+      }
     }
 
-    // ---------------- CHAT ----------------
-    if (msg.type === "chat") {
-      const roomId = msg.roomId;
-      const name = msg.name || "Player";
-      const text = msg.text || "";
+    // --- 5. GAME OVER (Update Leaderboard) ---
+    if (msg.type === "game_over") {
+      const winnerName = msg.winnerName; // sent by client logic
+      const loserName = msg.loserName;
+      
+      if (globalStats[winnerName]) globalStats[winnerName].wins++;
+      if (globalStats[loserName]) globalStats[loserName].losses++;
+      
+      // Don't broadcast lobby yet, wait for them to click "Back to Lobby"
+    }
 
-      if (!roomId || !rooms[roomId] || !text) return;
-
-      // Relay chat to the other player(s), not echoing back to sender
-      broadcastToRoom(
-        roomId,
-        {
-          type: "chat",
-          name,
-          text,
-        },
-        ws
-      );
+    // --- 6. RETURN TO LOBBY ---
+    if (msg.type === "return_lobby") {
+      clientData.state = "lobby";
+      broadcastLobby();
     }
   });
 
   ws.on("close", () => {
-    const roomId = clientRoom.get(ws);
-    if (!roomId) return;
-
-    const room = rooms[roomId];
-    if (!room) return;
-
-    room.players = room.players.filter((p) => p.ws !== ws);
-    clientRoom.delete(ws);
-
-    if (room.players.length === 0) {
-      delete rooms[roomId];
-      console.log(`Room ${roomId} deleted (no players left).`);
-    } else {
-      console.log(
-        `Client left room ${roomId}. Remaining players: ${room.players.length}`
-      );
-    }
+    clients.delete(ws);
+    broadcastLobby();
   });
 });
 
 server.listen(PORT, () => {
-  console.log(`BattleChess9000 WebSocket server listening on port ${PORT}`);
+  console.log(`BattleChess Lobby Server on ${PORT}`);
 });
