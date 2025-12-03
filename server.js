@@ -23,7 +23,7 @@ const globalStats = {};
 function broadcastLobby() {
   const lobbyList = [];
   for (let [ws, data] of clients) {
-    // Only show players actually in the public lobby
+    // Only show players actually in the public lobby (not playing or waiting in private)
     if (data.state === 'lobby') {
       lobbyList.push({
         id: data.id,
@@ -109,6 +109,7 @@ wss.on("connection", (ws) => {
 
         rooms[roomId] = { players: [ws], isPrivate: true };
         
+        // Send back the room ID so the client can generate the link
         send(ws, { type: 'private_created', roomId });
     }
 
@@ -121,7 +122,7 @@ wss.on("connection", (ws) => {
             const safeName = msg.name || "Guest";
             clientData.name = safeName;
             clientData.avatar = msg.avatar;
-            clientData.state = "playing"; // Go straight to playing
+            clientData.state = "playing"; 
 
             room.players.push(ws);
             startGame(roomId);
