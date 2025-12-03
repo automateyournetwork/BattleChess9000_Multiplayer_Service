@@ -2,29 +2,28 @@ import express from "express";
 import http from "http";
 import { WebSocketServer } from "ws";
 import cors from "cors";
-import { v4 as uuidv4 } from 'uuid'; // You might need: npm install uuid
+import { v4 as uuidv4 } from 'uuid';
 
 const PORT = process.env.PORT || 8080;
 const app = express();
 app.use(cors());
 
-app.get("/", (req, res) => res.send("BattleChess9000 Lobby Server Running"));
+app.get("/", (req, res) => res.send("BattleChess9000 Server Running"));
 
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server });
 
-// --- STATE MANAGEMENT ---
-// clients = Map<ws, { id, name, avatar, wins, losses, state: 'lobby'|'playing' }>
+// clients = Map<ws, { id, name, avatar, state: 'lobby'|'playing'|'waiting_private' }>
 const clients = new Map();
-// rooms = { roomId: { players: [ws, ws], gameData... } }
+// rooms = { roomId: { players: [ws, ws], isPrivate: bool } }
 const rooms = {};
 
-// Simple In-Memory Leaderboard (resets on restart)
-const globalStats = {}; // { "Username": { wins: 0, losses: 0 } }
+const globalStats = {}; 
 
 function broadcastLobby() {
   const lobbyList = [];
   for (let [ws, data] of clients) {
+    // Only show players actually in the public lobby
     if (data.state === 'lobby') {
       lobbyList.push({
         id: data.id,
@@ -47,10 +46,31 @@ function send(ws, data) {
   if (ws.readyState === ws.OPEN) ws.send(JSON.stringify(data));
 }
 
+function startGame(roomId) {
+    const room = rooms[roomId];
+    if(!room || room.players.length !== 2) return;
+
+    const p1 = room.players[0];
+    const p2 = room.players[1];
+    
+    // Update states
+    clients.get(p1).state = 'playing';
+    clients.get(p2).state = 'playing';
+
+    // Assign Colors
+    const p1Color = Math.random() < 0.5 ? 'w' : 'b';
+    const p2Color = p1Color === 'w' ? 'b' : 'w';
+
+    send(p1, { type: 'game_start', roomId, color: p1Color, opponent: clients.get(p2).name });
+    send(p2, { type: 'game_start', roomId, color: p2Color, opponent: clients.get(p1).name });
+
+    // Update lobby so these players disappear from the list
+    broadcastLobby();
+}
+
 wss.on("connection", (ws) => {
   const clientId = uuidv4();
   
-  // Initialize temporary client data
   clients.set(ws, { 
     id: clientId, 
     name: "Guest", 
@@ -64,11 +84,9 @@ wss.on("connection", (ws) => {
 
     const clientData = clients.get(ws);
 
-    // --- 1. LOGIN / ENTER LOBBY ---
+    // --- 1. LOGIN (PUBLIC LOBBY) ---
     if (msg.type === "login") {
       const safeName = msg.name.substring(0, 15) || "Player";
-      
-      // Init stats if new user
       if (!globalStats[safeName]) globalStats[safeName] = { wins: 0, losses: 0 };
 
       clientData.name = safeName;
@@ -76,16 +94,45 @@ wss.on("connection", (ws) => {
       clientData.state = "lobby";
       
       clients.set(ws, clientData);
-      
       send(ws, { type: 'login_success', myId: clientId });
       broadcastLobby();
     }
 
-    // --- 2. SEND CHALLENGE ---
+    // --- 2. CREATE PRIVATE LINK ---
+    if (msg.type === "create_private") {
+        const roomId = uuidv4();
+        const safeName = msg.name || "Host";
+        
+        clientData.name = safeName;
+        clientData.avatar = msg.avatar;
+        clientData.state = "waiting_private"; // Don't show in lobby list
+
+        rooms[roomId] = { players: [ws], isPrivate: true };
+        
+        send(ws, { type: 'private_created', roomId });
+    }
+
+    // --- 3. JOIN PRIVATE LINK ---
+    if (msg.type === "join_private") {
+        const roomId = msg.roomId;
+        const room = rooms[roomId];
+        
+        if (room && room.players.length < 2) {
+            const safeName = msg.name || "Guest";
+            clientData.name = safeName;
+            clientData.avatar = msg.avatar;
+            clientData.state = "playing"; // Go straight to playing
+
+            room.players.push(ws);
+            startGame(roomId);
+        } else {
+            send(ws, { type: 'error', message: "Room not found or full" });
+        }
+    }
+
+    // --- 4. LOBBY CHALLENGE LOGIC ---
     if (msg.type === "challenge_request") {
       const targetId = msg.targetId;
-      
-      // Find target socket
       for (let [targetWs, targetData] of clients) {
         if (targetData.id === targetId && targetData.state === 'lobby') {
           send(targetWs, { 
@@ -98,36 +145,21 @@ wss.on("connection", (ws) => {
       }
     }
 
-    // --- 3. ACCEPT CHALLENGE ---
     if (msg.type === "challenge_accept") {
       const opponentId = msg.targetId;
       let opponentWs = null;
-
-      // Find opponent
       for (let [oWs, oData] of clients) {
         if (oData.id === opponentId) { opponentWs = oWs; break; }
       }
 
       if (opponentWs) {
         const roomId = uuidv4();
-        rooms[roomId] = { players: [ws, opponentWs] };
-
-        // Update states
-        clientData.state = 'playing';
-        clients.get(opponentWs).state = 'playing';
-
-        // Assign Colors
-        const p1Color = Math.random() < 0.5 ? 'w' : 'b';
-        const p2Color = p1Color === 'w' ? 'b' : 'w';
-
-        send(ws, { type: 'game_start', roomId, color: p1Color, opponent: clients.get(opponentWs).name });
-        send(opponentWs, { type: 'game_start', roomId, color: p2Color, opponent: clientData.name });
-        
-        broadcastLobby(); // Remove them from the list for others
+        rooms[roomId] = { players: [ws, opponentWs], isPrivate: false };
+        startGame(roomId);
       }
     }
 
-    // --- 4. GAME MOVES ---
+    // --- 5. GAME MOVES ---
     if (msg.type === "move") {
       const roomId = msg.roomId;
       if (rooms[roomId]) {
@@ -137,30 +169,32 @@ wss.on("connection", (ws) => {
       }
     }
 
-    // --- 5. GAME OVER (Update Leaderboard) ---
+    // --- 6. GAME OVER ---
     if (msg.type === "game_over") {
-      const winnerName = msg.winnerName; // sent by client logic
+      const winnerName = msg.winnerName;
       const loserName = msg.loserName;
-      
       if (globalStats[winnerName]) globalStats[winnerName].wins++;
       if (globalStats[loserName]) globalStats[loserName].losses++;
-      
-      // Don't broadcast lobby yet, wait for them to click "Back to Lobby"
-    }
-
-    // --- 6. RETURN TO LOBBY ---
-    if (msg.type === "return_lobby") {
-      clientData.state = "lobby";
-      broadcastLobby();
     }
   });
 
   ws.on("close", () => {
+    // If user was in a room, clean it up or notify opponent
+    for (const roomId in rooms) {
+        const room = rooms[roomId];
+        if (room.players.includes(ws)) {
+            // Notify other player
+            room.players.forEach(pWs => {
+                if (pWs !== ws) send(pWs, { type: 'opponent_disconnected' });
+            });
+            delete rooms[roomId];
+        }
+    }
     clients.delete(ws);
     broadcastLobby();
   });
 });
 
 server.listen(PORT, () => {
-  console.log(`BattleChess Lobby Server on ${PORT}`);
+  console.log(`BattleChess Server on ${PORT}`);
 });
